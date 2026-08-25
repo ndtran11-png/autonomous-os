@@ -43,6 +43,32 @@ from hal.drivers.voice._internal.realtime_turn import (
 
 logger = logging.getLogger("hal.voice")
 
+# Sent instead of a transcript when the user cut the device off but their words
+# did not survive. They are talking over the loudspeaker, and cancellation on
+# this hardware is nearly all nonlinear suppression, which removes the near-end
+# along with the echo (measured WER 1.00 on real double talk). Going silent is
+# the worst possible response to being interrupted, so hand the floor back.
+INTERRUPTED_NO_TEXT = (
+    "[The user just interrupted you mid-sentence. Their words could not be made "
+    "out. Do not continue what you were saying and do not repeat it. Reply with "
+    "one short sentence handing them the floor, then stop.]"
+)
+# The words survived, but they were captured while the loudspeaker was still
+# playing, so they are partial and frequently mis-recognised. Saying so matters:
+# without it the model treats the fragment as the message and asks what it
+# meant, which starts a fresh reply — the opposite of being interrupted.
+INTERRUPTED_PREFIX = (
+    "[The user interrupted you mid-sentence. The text below was captured while "
+    "you were still talking, so it is partial and often mis-heard — treat it as "
+    "a hint, never as a quote. Stop what you were saying and do not resume it. "
+    "If the text clearly reads as an instruction or question, answer that in one "
+    "short sentence. Otherwise just acknowledge and hand them the floor. Never "
+    "quote the text back or ask what a garbled word meant.] "
+)
+# Below this many words a barge-in transcript is noise, not a request: measured
+# fragments were 'Oh,' and 'Hello?'. Asking about those reads as malfunction.
+INTERRUPTED_MIN_WORDS = 1
+
 # The two cascaded brains emit their own event classes with identical shape, so
 # the driver matches on either. Neither import pulls in pipecat itself.
 TEXT_CHUNK = (_PipecatText, _CascadedText)
@@ -220,6 +246,8 @@ def run_pipecat_turn(
     tts,
     strip_markers: Callable[[str], str],
     combined: str,
+    cancelled: Callable[[], bool] | None = None,
+    interrupted: bool = False,
 ) -> RealtimeTurnResult:
     """Send the transcript to the pipecat brain and speak its reply.
 
@@ -234,7 +262,17 @@ def run_pipecat_turn(
 
     user_text: str = (combined or "").strip()
     text: str = user_text
-    if not text:
+    usable = len(text.split()) >= INTERRUPTED_MIN_WORDS
+
+    if interrupted:
+        text = f"{INTERRUPTED_PREFIX}{text}" if usable else INTERRUPTED_NO_TEXT
+        logger.info(
+            "[pipecat] turn follows a barge-in (transcript=%r, usable=%s)",
+            user_text or "(empty)",
+            usable,
+        )
+
+    if not text or not usable:
         logger.info("[pipecat] empty transcript — nothing to send (no audio path)")
         return RealtimeTurnResult()
 
@@ -250,9 +288,23 @@ def run_pipecat_turn(
 
     _thinking_cue_start()
     wait_filler.arm()
+    stopped = False
+
+    def _cancelled() -> bool:
+        return cancelled is not None and cancelled()
 
     try:
         for event in session.run_turn(text):
+            if _cancelled():
+                # Barge-in. Drop the rest of the reply rather than queueing it
+                # behind the user's new question.
+                stopped = True
+                logger.info("[pipecat] barge-in — abandoning the rest of this reply")
+                try:
+                    session.abort_turn()
+                except Exception:
+                    pass
+                break
             if isinstance(event, TOOL_CALL):
                 if event.name == DELEGATE_TOOL_NAME:
                     delegated = True
@@ -333,7 +385,7 @@ def run_pipecat_turn(
             remaining: str = leak_filter.filter_text(
                 strip_markers(_repair_leaked_tool_calls(sentence_buf, fire=True))
             )
-            if remaining and tts is not None:
+            if remaining and tts is not None and not stopped:
                 if not first_sentence_sent:
                     logger.info("[pipecat] Final fragment → speak: %r", remaining[:80])
                     wait_filler.cancel()
@@ -351,11 +403,14 @@ def run_pipecat_turn(
             if first_sentence_sent or transcript:
                 handled = True
                 logger.info(
-                    "[pipecat] Chit-chat complete — agent_reply=%r",
+                    "[pipecat] %s — agent_reply=%r",
+                    "Interrupted mid-reply" if stopped else "Chit-chat complete",
                     transcript[:200] if transcript else "(empty)",
                 )
+                # Store what the user actually said, not the wrapper: the
+                # marker is guidance for this reply, not conversation history.
                 session.save_turn(
-                    user_text=user_text,
+                    user_text=user_text or "(interrupted — words not intelligible)",
                     agent_text=transcript or "(empty)",
                 )
             else:

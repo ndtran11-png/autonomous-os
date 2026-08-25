@@ -2002,11 +2002,15 @@ class VoiceService:
                 )
 
             if realtime_turn_started and self._cascaded:
+                self._barge_event.clear()
+                interrupted, self._barge_pending = self._barge_pending, False
                 rt = run_pipecat_turn(
                     self._realtime,
                     self._tts,
                     self.strip_rt_markers,
                     combined,
+                    cancelled=self._barge_event.is_set,
+                    interrupted=interrupted,
                 )
             elif realtime_turn_started:
                 rt = run_realtime_turn(
